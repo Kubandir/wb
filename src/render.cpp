@@ -351,7 +351,7 @@ static void renderReadingMode(const Editor& editor, int max_y, int max_x) {
             mvaddstr(row, 0, header.c_str());
             attroff(COLOR_PAIR(cp) | A_BOLD);
         } else {
-            renderSegment(row, 0, *rl.text, rl.seg_cs, rl.seg_ce, -1, false, rl.seg_cont, rl.seg_vi, "");
+            renderSegment(row, 0, *rl.text, rl.seg_cs, rl.seg_ce, -1, false, rl.seg_cont, rl.seg_vi, "", false);
         }
     }
     while(row < max_y) { move(row++, 0); clrtoeol(); }

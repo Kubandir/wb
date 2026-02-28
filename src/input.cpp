@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <climits>
 
 static int lineNumWidth(int n) {
     int w = 1;
@@ -401,6 +402,20 @@ static void handleMouse(Editor& editor, MEVENT& event) {
     if(ctrl_held) jumpToWikilink(editor);
 
     editor.needs_redraw = true;
+}
+
+static int countWords(const Editor& editor) {
+    int count = 0;
+    for(auto& p : editor.parts) {
+        for(auto& line : p.lines) {
+            bool in_word = false;
+            for(char c : line) {
+                if(std::isspace((unsigned char)c)) { in_word = false; }
+                else { if(!in_word) count++; in_word = true; }
+            }
+        }
+    }
+    return count;
 }
 
 static bool confirmExit(Editor& editor) {
@@ -823,4 +838,3 @@ bool handleInput(Editor& editor, int ch) {
     }
     return true;
 }
-
