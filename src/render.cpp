@@ -20,18 +20,6 @@ static int utf8ScreenWidth(const std::string& s, int byte_pos) {
     return 1;
 }
 
-static int visibleScreenWidth(const std::string& line, int from, int to) {
-    int w = 0, i = from;
-    while(i < to) {
-        if(i + 1 < (int)line.size() && line[i] == '*' && line[i+1] == '*') { i += 2; continue; }
-        if(isHeaderMarker(line, i)) { i += 3; continue; }
-        w += utf8ScreenWidth(line, i);
-        i += utf8CharLen(line, i);
-    }
-    return w;
-}
-
-// Returns byte position of wikilink start if line[i] starts '[', else -1; sets end to past ']'
 static int wikilinkAt(const std::string& line, int i, int& end) {
     if(line[i] != '[') return -1;
     size_t close = line.find(']', i + 1);
@@ -40,15 +28,118 @@ static int wikilinkAt(const std::string& line, int i, int& end) {
     return i;
 }
 
-std::vector<SegmentInfo> buildSegments(const std::vector<std::string>& lines, int max_x, const std::set<int>* folded) {
+static int visibleScreenWidth(const std::string& line, int from, int to, bool count_markers = false) {
+    int w = 0, i = from;
+    while(i < to) {
+        if(i + 1 < (int)line.size() && line[i] == '*' && line[i+1] == '*') {
+            if(count_markers) w += 2;
+            i += 2; continue;
+        }
+        if(isHeaderMarker(line, i)) {
+            if(count_markers) w += 3;
+            i += 3; continue;
+        }
+        if(line[i] == '[') {
+            int end_pos;
+            if(wikilinkAt(line, i, end_pos) >= 0 && end_pos <= to) {
+                int inner_start = i + 1;
+                int inner_end   = end_pos - 1;
+                int display_start = inner_start;
+                for(int di = inner_start; di < inner_end; di++)
+                    if(line[di] == '.') display_start = di + 1;
+                w += visibleScreenWidth(line, display_start, inner_end, count_markers);
+                i = end_pos; continue;
+            }
+        }
+        w += utf8ScreenWidth(line, i);
+        i += utf8CharLen(line, i);
+    }
+    return w;
+}
+
+static void buildLineSegments(const std::string& line, int li, int max_x, int cursor_line,
+                               std::vector<SegmentInfo>& segs) {
+    bool reveal = (cursor_line == li);
+    if(line.empty()) { segs.push_back({li, 0, 0, false, 0}); return; }
+    int leading = 0;
+    while(leading < (int)line.length() && line[leading] == ' ') leading++;
+    int visual_indent = leading;
+    if(leading + 1 < (int)line.length() && line[leading] == '-' && line[leading+1] == ' ')
+        visual_indent = leading + 2;
+    bool first = true;
+    int seg_start = 0, screen_w = 0, i = 0;
+    while(i <= (int)line.length()) {
+        if(i == (int)line.length()) {
+            segs.push_back({li, seg_start, i, !first, first ? 0 : visual_indent});
+            break;
+        }
+        if(i + 1 < (int)line.length() && line[i] == '*' && line[i+1] == '*') {
+            if(reveal) screen_w += 2;
+            i += 2; continue;
+        }
+        if(isHeaderMarker(line, i)) {
+            if(reveal) screen_w += 3;
+            i += 3; continue;
+        }
+        if(line[i] == '[') {
+            int end_pos;
+            if(wikilinkAt(line, i, end_pos) >= 0) {
+                int inner_start = i + 1;
+                int inner_end   = end_pos - 1;
+                int inner_w;
+                if(reveal) {
+                    inner_w = 2 + visibleScreenWidth(line, inner_start, inner_end, true);
+                } else {
+                    int display_start = inner_start;
+                    for(int di = inner_start; di < inner_end; di++)
+                        if(line[di] == '.') display_start = di + 1;
+                    inner_w = visibleScreenWidth(line, display_start, inner_end);
+                }
+                int effective_max = first ? max_x : max_x - visual_indent;
+                if(screen_w + inner_w > effective_max) {
+                    int break_pos = i;
+                    while(break_pos > seg_start && line[break_pos] != ' ') break_pos--;
+                    if(break_pos == seg_start) break_pos = i;
+                    else break_pos++;
+                    segs.push_back({li, seg_start, break_pos, !first, first ? 0 : visual_indent});
+                    first = false;
+                    seg_start = break_pos;
+                    if(seg_start < (int)line.length() && line[seg_start] == ' ') seg_start++;
+                    screen_w = 0;
+                    i = seg_start;
+                    continue;
+                }
+                screen_w += inner_w;
+                i = end_pos;
+                continue;
+            }
+        }
+        int clen = utf8CharLen(line, i);
+        int cw = utf8ScreenWidth(line, i);
+        int effective_max = first ? max_x : max_x - visual_indent;
+        if(screen_w + cw > effective_max) {
+            int break_pos = i;
+            while(break_pos > seg_start && line[break_pos] != ' ') break_pos--;
+            if(break_pos == seg_start) break_pos = i;
+            else break_pos++;
+            segs.push_back({li, seg_start, break_pos, !first, first ? 0 : visual_indent});
+            first = false;
+            seg_start = break_pos;
+            if(seg_start < (int)line.length() && line[seg_start] == ' ') seg_start++;
+            screen_w = 0;
+            i = seg_start;
+        } else { screen_w += cw; i += clen; }
+    }
+}
+
+std::vector<SegmentInfo> buildSegments(const std::vector<std::string>& lines, int max_x,
+                                        const std::set<int>* folded, int cursor_line) {
     std::vector<SegmentInfo> segs;
     int n = (int)lines.size();
     int li = 0;
     while(li < n) {
         const std::string& line = lines[li];
-        // Folding: if this line is a header and is folded, skip until next header of same/higher level
         if(folded && !folded->empty() && folded->count(li)) {
-            // emit the header line itself, then skip body
             segs.push_back({li, 0, (int)line.size(), false, 0});
             int fold_level = (isHeaderMarker(line, 0)) ? (line[1] - '0') : 0;
             li++;
@@ -59,37 +150,7 @@ std::vector<SegmentInfo> buildSegments(const std::vector<std::string>& lines, in
             }
             continue;
         }
-        if(line.empty()) { segs.push_back({li, 0, 0, false, 0}); li++; continue; }
-        int leading = 0;
-        while(leading < (int)line.length() && line[leading] == ' ') leading++;
-        int visual_indent = leading;
-        if(leading + 1 < (int)line.length() && line[leading] == '-' && line[leading+1] == ' ')
-            visual_indent = leading + 2;
-        bool first = true;
-        int seg_start = 0, screen_w = 0, i = 0;
-        while(i <= (int)line.length()) {
-            if(i == (int)line.length()) {
-                segs.push_back({li, seg_start, i, !first, first ? 0 : visual_indent});
-                break;
-            }
-            if(i + 1 < (int)line.length() && line[i] == '*' && line[i+1] == '*') { i += 2; continue; }
-            if(isHeaderMarker(line, i)) { i += 3; continue; }
-            int clen = utf8CharLen(line, i);
-            int cw = utf8ScreenWidth(line, i);
-            int effective_max = first ? max_x : max_x - visual_indent;
-            if(screen_w + cw > effective_max) {
-                int break_pos = i;
-                while(break_pos > seg_start && line[break_pos] != ' ') break_pos--;
-                if(break_pos == seg_start) break_pos = i;
-                else break_pos++;
-                segs.push_back({li, seg_start, break_pos, !first, first ? 0 : visual_indent});
-                first = false;
-                seg_start = break_pos;
-                if(seg_start < (int)line.length() && line[seg_start] == ' ') seg_start++;
-                screen_w = 0;
-                i = seg_start;
-            } else { screen_w += cw; i += clen; }
-        }
+        buildLineSegments(line, li, max_x, cursor_line, segs);
         li++;
     }
     return segs;
@@ -102,9 +163,9 @@ static int headerColorPair(char digit) {
 }
 
 static void renderSegment(int y, int start_x, const std::string& line, int char_start, int char_end,
-                           int cursor_pos, bool show_cursor, bool is_continuation,
+                           int cursor_pos, bool is_continuation,
                            int visual_indent, const std::string& search_query,
-                           bool is_folded_header) {
+                           bool is_folded_header, bool cursor_on_line) {
     int x = start_x;
     if(is_continuation && visual_indent > 0) {
         static char spaces[256];
@@ -120,7 +181,6 @@ static void renderSegment(int y, int start_x, const std::string& line, int char_
         attroff(COLOR_PAIR(CP_SUBTLE));
     }
 
-    // Precompute lowercased versions for case-insensitive search
     std::string line_lower;
     std::string sq_lower;
     int sq_len = (int)search_query.size();
@@ -132,40 +192,69 @@ static void renderSegment(int y, int start_x, const std::string& line, int char_
     bool in_bold = false;
     int header_color = 0;
     int cur_attr = A_NORMAL;
+
+    if(char_start > 0) {
+        int pi = 0;
+        while(pi < char_start) {
+            if(pi + 1 < (int)line.size() && line[pi] == '*' && line[pi+1] == '*') {
+                in_bold = !in_bold; pi += 2; continue;
+            }
+            if(isHeaderMarker(line, pi)) {
+                header_color = (header_color == 0) ? headerColorPair(line[pi+1]) : 0;
+                pi += 3; continue;
+            }
+            pi += utf8CharLen(line, pi);
+        }
+    }
+
     int i = char_start;
 
     while(i < char_end) {
         if(i + 1 < (int)line.size() && line[i] == '*' && line[i+1] == '*') {
-            if(show_cursor && (cursor_pos == i || cursor_pos == i + 1)) {
-                int a = header_color ? (COLOR_PAIR(header_color) | A_BOLD) :
-                         in_bold ? (COLOR_PAIR(CP_ACCENT) | A_BOLD) : A_NORMAL;
+            in_bold = !in_bold;
+            if(cursor_on_line) {
+                int a = COLOR_PAIR(CP_ACCENT) | A_BOLD;
                 if(a != cur_attr) { attrset(a); cur_attr = a; }
                 mvaddch(y, x++, '*'); mvaddch(y, x++, '*');
-            } else { in_bold = !in_bold; }
+            }
             i += 2; continue;
         }
         if(isHeaderMarker(line, i)) {
-            if(show_cursor && (cursor_pos == i || cursor_pos == i+1 || cursor_pos == i+2)) {
-                int a = COLOR_PAIR(headerColorPair(line[i+1])) | A_BOLD;
+            int hcp = headerColorPair(line[i+1]);
+            if(!cursor_on_line) {
+                header_color = (header_color == 0) ? hcp : 0;
+            } else {
+                header_color = hcp;
+                int a = COLOR_PAIR(hcp) | A_BOLD;
                 if(a != cur_attr) { attrset(a); cur_attr = a; }
                 mvaddch(y, x++, '#'); mvaddch(y, x++, line[i+1]); mvaddch(y, x++, ' ');
-            } else {
-                header_color = (header_color == 0) ? headerColorPair(line[i+1]) : 0;
             }
             i += 3; continue;
         }
         if(line[i] == '[') {
             int end_pos;
             if(wikilinkAt(line, i, end_pos) >= 0 && end_pos <= char_end) {
+                int inner_start = i + 1;
+                int inner_end   = end_pos - 1;
                 int a = COLOR_PAIR(CP_ACCENT) | A_UNDERLINE;
-                if(a != cur_attr) { attrset(a); cur_attr = a; }
-                mvaddnstr(y, x, line.c_str() + i, end_pos - i);
-                x += visibleScreenWidth(line, i, end_pos);
+                if(cursor_on_line) {
+                    if(a != cur_attr) { attrset(a); cur_attr = a; }
+                    mvaddch(y, x++, '[');
+                    mvaddnstr(y, x, line.c_str() + inner_start, inner_end - inner_start);
+                    x += visibleScreenWidth(line, inner_start, inner_end, true);
+                    mvaddch(y, x++, ']');
+                } else {
+                    int display_start = inner_start;
+                    for(int di = inner_start; di < inner_end; di++)
+                        if(line[di] == '.') display_start = di + 1;
+                    if(a != cur_attr) { attrset(a); cur_attr = a; }
+                    mvaddnstr(y, x, line.c_str() + display_start, inner_end - display_start);
+                    x += visibleScreenWidth(line, display_start, inner_end);
+                }
                 i = end_pos;
                 continue;
             }
         }
-        // Case-insensitive search highlight
         if(sq_len > 0 && i + sq_len <= char_end &&
            memcmp(line_lower.c_str() + i, sq_lower.c_str(), sq_len) == 0) {
             int a = COLOR_PAIR(CP_SEARCH_HL) | A_BOLD;
@@ -278,7 +367,6 @@ static void renderTabBar(Editor& editor, int max_x) {
         bool is_renaming = (tb.mode == TabBarMode::RENAMING && tb.rename_idx == i);
 
         std::string inner = is_renaming ? tb.input_buf : parts[i].name;
-        // focused tab shows <name>, others show name with spaces
         std::string label = is_focused ? ("<" + inner + ">") : (" " + inner + " ");
         int label_w = (int)label.size();
 
@@ -351,7 +439,7 @@ static void renderReadingMode(const Editor& editor, int max_y, int max_x) {
             mvaddstr(row, 0, header.c_str());
             attroff(COLOR_PAIR(cp) | A_BOLD);
         } else {
-            renderSegment(row, 0, *rl.text, rl.seg_cs, rl.seg_ce, -1, false, rl.seg_cont, rl.seg_vi, "", false);
+            renderSegment(row, 0, *rl.text, rl.seg_cs, rl.seg_ce, -1, rl.seg_cont, rl.seg_vi, "", false, false);
         }
     }
     while(row < max_y) { move(row++, 0); clrtoeol(); }
@@ -380,10 +468,11 @@ void initRender() {
     raw();
     noecho();
     keypad(stdscr, TRUE);
+    leaveok(stdscr, TRUE);
     define_key("\033[1;5D", KEY_CTRL_LEFT);
     define_key("\033[1;5C", KEY_CTRL_RIGHT);
-    define_key("\033[1;5A", 566);   // Ctrl+Up
-    define_key("\033[1;5B", 525);   // Ctrl+Down
+    define_key("\033[1;5A", 566);
+    define_key("\033[1;5B", 525);
     timeout(-1);
     curs_set(1);
     printf("\033[6 q");
@@ -403,16 +492,77 @@ static int lineNumWidth(int total_lines) {
     return w;
 }
 
+static int computeCursorScreenX(const std::string& line, int seg_start, int cursor_x, bool cursor_on_line) {
+    int x = 0;
+    int i = seg_start;
+    while(i < cursor_x) {
+        if(i + 1 < (int)line.size() && line[i] == '*' && line[i+1] == '*') {
+            if(cursor_on_line) {
+                if(i < cursor_x) { x += 1; i++; }
+                if(i < cursor_x) { x += 1; i++; }
+            } else {
+                i += 2;
+            }
+            continue;
+        }
+        if(isHeaderMarker(line, i)) {
+            if(cursor_on_line) {
+                if(i < cursor_x) { x += 1; i++; }
+                if(i < cursor_x) { x += 1; i++; }
+                if(i < cursor_x) { x += 1; i++; }
+            } else {
+                i += 3;
+            }
+            continue;
+        }
+        if(line[i] == '[') {
+            int end_pos;
+            if(wikilinkAt(line, i, end_pos) >= 0) {
+                if(cursor_on_line) {
+                    if(i < cursor_x) { x += 1; i++; }
+                    while(i < end_pos - 1 && i < cursor_x) {
+                        x += utf8ScreenWidth(line, i);
+                        i += utf8CharLen(line, i);
+                    }
+                    if(i >= cursor_x) return x;
+                    if(i < cursor_x) { x += 1; i++; }
+                    if(i >= end_pos) continue;
+                } else {
+                    int inner_start = i + 1;
+                    int inner_end   = end_pos - 1;
+                    int display_start = inner_start;
+                    for(int di = inner_start; di < inner_end; di++)
+                        if(line[di] == '.') display_start = di + 1;
+                    if(cursor_x >= end_pos) {
+                        x += visibleScreenWidth(line, display_start, inner_end);
+                        i = end_pos;
+                    } else {
+                        int disp_pos = std::max(display_start, std::min(cursor_x, inner_end));
+                        x += visibleScreenWidth(line, display_start, disp_pos);
+                        return x;
+                    }
+                    continue;
+                }
+                continue;
+            }
+        }
+        x += utf8ScreenWidth(line, i);
+        i += utf8CharLen(line, i);
+    }
+    return x;
+}
+
 void renderEditor(Editor& editor) {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
     if(max_y < 3 || max_x < 4) return;
 
+    curs_set(0);
+
     editor.cursor_y = std::max(0, std::min(editor.cursor_y, (int)editor.lines().size() - 1));
     editor.cursor_x = std::max(0, std::min(editor.cursor_x, (int)editor.lines()[editor.cursor_y].length()));
 
     if(editor.reading_mode) {
-        curs_set(0);
         for(int r = 0; r < max_y; r++) { move(r, 0); clrtoeol(); }
         renderReadingMode(editor, max_y, max_x);
         refresh();
@@ -430,15 +580,32 @@ void renderEditor(Editor& editor) {
     if(text_w < 4) { lnw = 0; text_w = max_x; }
 
     if(editor.segments_dirty) {
-        editor.last_segments = buildSegments(editor.lines(), text_w, &editor.parts[editor.active_part].folded_lines);
+        editor.last_segments = buildSegments(editor.lines(), text_w,
+            &editor.parts[editor.active_part].folded_lines, editor.cursor_y);
         editor.segments_dirty = false;
     }
     const auto& segs = editor.last_segments;
 
-    clampScroll(editor, (int)segs.size(), content_rows);
+    int max_scroll = std::max(0, (int)segs.size() - 1);
+    editor.scroll_offset = std::max(0, std::min(editor.scroll_offset, max_scroll));
 
-    int cursor_screen_row = content_y_start;
+    int cursor_screen_row = -1;
     int cursor_screen_col = 0;
+
+    for(int r = 0; r < content_rows; r++) {
+        int seg_idx = editor.scroll_offset + r;
+        if(seg_idx >= (int)segs.size()) break;
+        const auto& seg = segs[seg_idx];
+        if(seg.logical_line == editor.cursor_y &&
+           editor.cursor_x >= seg.char_start && editor.cursor_x <= seg.char_end) {
+            cursor_screen_row = content_y_start + r;
+            int col_off = lnw > 0 ? 1 : 0;
+            int indent   = seg.is_continuation ? seg.visual_indent : 0;
+            cursor_screen_col = col_off + indent +
+                computeCursorScreenX(editor.lines()[editor.cursor_y], seg.char_start, editor.cursor_x, true);
+            break;
+        }
+    }
 
     for(int r = content_y_start; r < max_y; r++) { move(r, 0); clrtoeol(); }
 
@@ -448,13 +615,14 @@ void renderEditor(Editor& editor) {
         int seg_idx = editor.scroll_offset + row;
         if(seg_idx >= (int)segs.size()) break;
         const auto& seg = segs[seg_idx];
-        bool show_cursor = seg.logical_line == editor.cursor_y;
+        bool cursor_on_line = (seg.logical_line == editor.cursor_y);
         int screen_row = content_y_start + row;
         const std::string& line = editor.lines()[seg.logical_line];
         bool is_folded = editor.parts[editor.active_part].folded_lines.count(seg.logical_line) > 0;
 
         renderSegment(screen_row, lnw > 0 ? 1 : 0, line, seg.char_start, seg.char_end,
-                      editor.cursor_x, show_cursor, seg.is_continuation, seg.visual_indent, sq, is_folded);
+                      editor.cursor_x, seg.is_continuation, seg.visual_indent, sq, is_folded,
+                      cursor_on_line);
 
         if(lnw > 0 && !seg.is_continuation) {
             attron(COLOR_PAIR(CP_SUBTLE));
@@ -463,25 +631,22 @@ void renderEditor(Editor& editor) {
             mvaddstr(screen_row, max_x - lnw, lnbuf);
             attroff(COLOR_PAIR(CP_SUBTLE));
         }
-
-        if(show_cursor &&
-           editor.cursor_x >= seg.char_start && editor.cursor_x <= seg.char_end) {
-            cursor_screen_row = screen_row;
-            int indent = seg.is_continuation ? seg.visual_indent : 0;
-            int col_off = lnw > 0 ? 1 : 0;
-            cursor_screen_col = col_off + indent + visibleScreenWidth(line, seg.char_start, editor.cursor_x);
-        }
     }
 
     if(editor.search.active) {
-        curs_set(0);
         renderSearch(editor.search, max_y, max_x);
+        refresh();
     } else {
         if(editor.notification.active)
             renderNotification(editor.notification, max_y, max_x);
-        move(cursor_screen_row, cursor_screen_col);
-        curs_set(1);
+        if(cursor_screen_row >= 0) {
+            move(cursor_screen_row, cursor_screen_col);
+            leaveok(stdscr, FALSE);
+            curs_set(1);
+            refresh();
+            leaveok(stdscr, TRUE);
+        } else {
+            refresh();
+        }
     }
-
-    refresh();
 }

@@ -23,7 +23,8 @@ static void rebuildSegmentsIfDirty(Editor& editor) {
     int lnw = lineNumWidth((int)editor.lines().size());
     int text_w = max_x - lnw - 1;
     if(text_w < 4) text_w = max_x;
-    editor.last_segments = buildSegments(editor.lines(), text_w, &editor.parts[editor.active_part].folded_lines);
+    editor.last_segments = buildSegments(editor.lines(), text_w,
+        &editor.parts[editor.active_part].folded_lines, editor.cursor_y);
     editor.segments_dirty = false;
 }
 
@@ -105,7 +106,6 @@ static void switchPart(Editor& editor, int idx) {
     editor.needs_redraw = true;
 }
 
-// Iterative clampTabScroll (fixes recursion)
 static void clampTabScroll(Editor& editor) {
     int max_y, max_x;
     getmaxyx(stdscr, max_y, max_x);
@@ -115,10 +115,7 @@ static void clampTabScroll(Editor& editor) {
     if(n == 0 || tb.cursor < 0) return;
     tb.cursor = std::max(0, std::min(tb.cursor, n - 1));
 
-    // Scroll left until cursor is reachable
     while(tb.cursor < tb.scroll_offset) tb.scroll_offset--;
-
-    // Scroll right until cursor fits
     while(true) {
         int tab_area_end = max_x - 3;
         int x = 3 + (tb.scroll_offset > 0 ? 2 : 0);
@@ -138,11 +135,9 @@ static void clampTabScroll(Editor& editor) {
     }
 }
 
-// Global search: finds next match across all parts starting from current position
 static void findNext(Editor& editor, bool from_start = false) {
     if(editor.search.query.empty()) return;
     const std::string& q = editor.search.query;
-    // lowercase query once
     std::string ql;
     for(char c : q) ql += std::tolower((unsigned char)c);
 
@@ -156,7 +151,6 @@ static void findNext(Editor& editor, bool from_start = false) {
             const auto& plines = editor.parts[pi].lines;
             int li_start = (pass == 0 && pi == start_part) ? start_line : 0;
             for(int li = li_start; li < (int)plines.size(); li++) {
-                // case-insensitive: lowercase the line
                 std::string ll;
                 for(char c : plines[li]) ll += std::tolower((unsigned char)c);
                 size_t col_start = (pass == 0 && pi == start_part && li == start_line) ? (size_t)start_col : 0;
@@ -178,7 +172,6 @@ static void findNext(Editor& editor, bool from_start = false) {
     }
 }
 
-// Toggle fold — never moves the cursor, just clamps cursor_y to nearest visible line
 static void toggleFold(Editor& editor, int line_idx) {
     const std::string& line = editor.lines()[line_idx];
     if(!isHeaderMarker(line, 0)) return;
@@ -189,12 +182,10 @@ static void toggleFold(Editor& editor, int line_idx) {
     editor.segments_dirty = true;
     rebuildSegmentsIfDirty(editor);
 
-    // Check if cursor_y is still visible
     const auto& segs = editor.last_segments;
     for(auto& s : segs)
         if(s.logical_line == editor.cursor_y) { editor.needs_redraw = true; return; }
 
-    // Cursor hidden: find nearest visible line at or after cursor_y
     int best = -1;
     int best_dist = INT_MAX;
     for(auto& s : segs) {
@@ -206,19 +197,15 @@ static void toggleFold(Editor& editor, int line_idx) {
         editor.cursor_y = best;
         editor.cursor_x = 0;
     }
-    // Don't touch scroll_offset — let renderEditor's clampScroll handle it naturally
     editor.needs_redraw = true;
 }
 
-// Normalize a string for wikilink matching: lowercase, remove spaces
 static std::string normalizeLink(const std::string& s) {
     std::string out;
     for(char c : s) if(c != ' ') out += std::tolower((unsigned char)c);
     return out;
 }
 
-// Jump to wikilink: supports "partname" or "partname.header" or "partname.h1.h2"
-// Also supports bare "header" that matches within the current part
 static void jumpToWikilink(Editor& editor) {
     const std::string& line = editor.lines()[editor.cursor_y];
     int bracket_start = -1;
@@ -231,7 +218,6 @@ static void jumpToWikilink(Editor& editor) {
     if(close == std::string::npos) return;
     std::string raw = line.substr(bracket_start + 1, close - bracket_start - 1);
 
-    // Split by '.'
     std::vector<std::string> parts_path;
     {
         std::string seg;
@@ -243,7 +229,6 @@ static void jumpToWikilink(Editor& editor) {
     }
     if(parts_path.empty()) return;
 
-    // Try to match first segment to a part name
     int target_part = editor.active_part;
     int header_start = 0;
     std::string first_norm = normalizeLink(parts_path[0]);
@@ -255,18 +240,15 @@ static void jumpToWikilink(Editor& editor) {
         }
     }
 
-    // Navigate to part
     if(target_part != editor.active_part) switchPart(editor, target_part);
 
     if(header_start >= (int)parts_path.size()) {
-        // Just part, go to top
         editor.cursor_y = 0; editor.cursor_x = 0;
         scrollToCursor(editor);
         editor.needs_redraw = true;
         return;
     }
 
-    // Find headers sequentially
     const auto& plines = editor.parts[target_part].lines;
     int search_from = 0;
     int last_found_line = 0;
@@ -274,7 +256,6 @@ static void jumpToWikilink(Editor& editor) {
         std::string want = normalizeLink(parts_path[hi]);
         for(int li = search_from; li < (int)plines.size(); li++) {
             if(isHeaderMarker(plines[li], 0)) {
-                // Extract header text (after "#N ")
                 std::string htext = plines[li].substr(3);
                 if(normalizeLink(htext) == want) {
                     last_found_line = li;
@@ -383,7 +364,6 @@ static void handleMouse(Editor& editor, MEVENT& event) {
         return;
     }
 
-    // Ctrl+Click = wikilink jump
     bool ctrl_held = (event.bstate & BUTTON_CTRL);
 
     editor.cursor_y = seg.logical_line;
@@ -485,6 +465,8 @@ static void handleBackspace(Editor& editor) {
         editor.lines().erase(editor.lines().begin() + editor.cursor_y);
         editor.cursor_y--;
     }
+    editor.cursor_y = std::max(0, std::min(editor.cursor_y, (int)editor.lines().size() - 1));
+    editor.cursor_x = std::max(0, std::min(editor.cursor_x, (int)editor.lines()[editor.cursor_y].length()));
     editor.segments_dirty = true;
 }
 
@@ -545,6 +527,47 @@ static void finishRename(Editor& editor) {
     editor.tabbar.focused = false;
 }
 
+static void moveWordLeft(Editor& editor) {
+    if(editor.cursor_x == 0) {
+        if(editor.cursor_y == 0) return;
+        editor.cursor_y--;
+        editor.cursor_x = (int)editor.lines()[editor.cursor_y].size();
+        editor.preferred_x = editor.cursor_x;
+        editor.segments_dirty = true;
+        editor.needs_redraw = true;
+        return;
+    }
+    const std::string& line = editor.lines()[editor.cursor_y];
+    int pos = editor.cursor_x;
+    while(pos > 0 && line[pos-1] == ' ') pos -= utf8PrevCharLen(line, pos);
+    while(pos > 0 && line[pos-1] != ' ') pos -= utf8PrevCharLen(line, pos);
+    editor.cursor_x = pos;
+    editor.preferred_x = pos;
+    editor.segments_dirty = true;
+    editor.needs_redraw = true;
+}
+
+static void moveWordRight(Editor& editor) {
+    const std::string& line = editor.lines()[editor.cursor_y];
+    int pos = editor.cursor_x;
+    int len = (int)line.size();
+    if(pos == len) {
+        if(editor.cursor_y >= (int)editor.lines().size() - 1) return;
+        editor.cursor_y++;
+        editor.cursor_x = 0;
+        editor.preferred_x = 0;
+        editor.segments_dirty = true;
+        editor.needs_redraw = true;
+        return;
+    }
+    while(pos < len && line[pos] != ' ') pos += utf8CharLen(line, pos);
+    while(pos < len && line[pos] == ' ') pos += utf8CharLen(line, pos);
+    editor.cursor_x = pos;
+    editor.preferred_x = pos;
+    editor.segments_dirty = true;
+    editor.needs_redraw = true;
+}
+
 static void activatePlus(Editor& editor) {
     editor.parts.push_back({"New Part", {""}, 0, {}});
     int idx = (int)editor.parts.size() - 1;
@@ -576,7 +599,6 @@ bool handleInput(Editor& editor, int ch) {
         return true;
     }
 
-    // Ctrl+E — cycle focus
     if(ch == 5) {
         TabBar& tb = editor.tabbar;
         if(tb.mode == TabBarMode::RENAMING) {
@@ -603,7 +625,6 @@ bool handleInput(Editor& editor, int ch) {
         return true;
     }
 
-    // reading mode
     if(editor.reading_mode) {
         if(ch == 27) { editor.reading_mode = false; editor.reading_scroll = 0; }
         else if(ch == KEY_UP)   editor.reading_scroll = std::max(0, editor.reading_scroll - 1);
@@ -738,7 +759,6 @@ bool handleInput(Editor& editor, int ch) {
         return true;
     }
 
-    // search mode
     if(editor.search.active) {
         if(ch == 27) { editor.search.active = false; editor.needs_redraw = true; }
         else if(ch == '\n' || ch == KEY_ENTER || ch == 13) findNext(editor);
@@ -773,7 +793,6 @@ bool handleInput(Editor& editor, int ch) {
     else if(ch == 19) {
         if(!editor.filepath.empty()) { saveFile(editor, editor.filepath); setNotification(editor, "Saved!"); }
     }
-    // Ctrl+G = toggle fold (Ctrl+F is search)
     else if(ch == 7) {
         toggleFold(editor, editor.cursor_y);
     }
@@ -790,23 +809,22 @@ bool handleInput(Editor& editor, int ch) {
     else if(ch == '\t') { pushUndo(editor); handleTab(editor); editor.segments_dirty = true; editor.needs_redraw = true; }
     else if(ch == KEY_UP) { cursorUp(editor); editor.needs_redraw = true; }
     else if(ch == KEY_DOWN) { cursorDown(editor); editor.needs_redraw = true; }
-    // Ctrl+Up/Down: scroll 5 segments
     else if(ch == 566) { for(int i = 0; i < 5; i++) cursorUp(editor); editor.needs_redraw = true; }
     else if(ch == 525) { for(int i = 0; i < 5; i++) cursorDown(editor); editor.needs_redraw = true; }
-    else if(ch == KEY_CTRL_LEFT)  { movePart(editor, -1); }
-    else if(ch == KEY_CTRL_RIGHT) { movePart(editor, 1); }
+    else if(ch == KEY_CTRL_LEFT)  { moveWordLeft(editor); }
+    else if(ch == KEY_CTRL_RIGHT) { moveWordRight(editor); }
     else if(ch == KEY_LEFT) {
         const std::string& line = editor.lines()[editor.cursor_y];
-        if(editor.cursor_x >= 2 && line[editor.cursor_x-2] == '*' && line[editor.cursor_x-1] == '*') editor.cursor_x -= 2;
-        else if(editor.cursor_x > 0) editor.cursor_x -= utf8PrevCharLen(line, editor.cursor_x);
+        if(editor.cursor_x > 0) editor.cursor_x -= utf8PrevCharLen(line, editor.cursor_x);
         editor.preferred_x = editor.cursor_x;
+        editor.segments_dirty = true;
         editor.needs_redraw = true;
     }
     else if(ch == KEY_RIGHT) {
         const std::string& line = editor.lines()[editor.cursor_y];
-        if(editor.cursor_x + 1 < (int)line.length() && line[editor.cursor_x] == '*' && line[editor.cursor_x+1] == '*') editor.cursor_x += 2;
-        else if(editor.cursor_x < (int)line.length()) editor.cursor_x += utf8CharLen(line, editor.cursor_x);
+        if(editor.cursor_x < (int)line.length()) editor.cursor_x += utf8CharLen(line, editor.cursor_x);
         editor.preferred_x = editor.cursor_x;
+        editor.segments_dirty = true;
         editor.needs_redraw = true;
     }
     else if(ch == 8)  { pushUndo(editor); handleWordBackspace(editor); editor.segments_dirty = true; editor.needs_redraw = true; }
